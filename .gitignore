@@ -1,0 +1,7 @@
+node_modules/
+build/
+*.bmp
+*.mp4
+*.node
+*.log
+.vscode/
