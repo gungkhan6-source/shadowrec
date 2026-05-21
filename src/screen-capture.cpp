@@ -12,13 +12,17 @@
 #include <dxgi1_2.h>
 #define _CRT_SECURE_NO_WARNINGS
 #include <TlHelp32.h>
+#include <Psapi.h>
 #include <fstream>
 #include <vector>
 #include <string>
 #include <chrono>
+#include <set>
+#include <algorithm>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "psapi.lib")
 
 // ═══════════════════════════════════════════════════════════════════════
 // SCREEN CAPTURER SINIFI (DXGI - Phase 1, hiç dokunulmadı)
@@ -311,7 +315,7 @@ public:
         return true;
     }
     
-    bool Start(const std::string& processName, const std::string& dllPath, std::string& errorMsg) {
+    bool Start(const std::string& processName, const std::string& dllPath, std::string& errorMsg, bool skipInject = false) {
         if (initialized) { errorMsg = "Zaten baslamış"; return false; }
         
         // Hedef process bul
@@ -341,16 +345,22 @@ public:
         header = (SharedFrameHeader*)mapped;
         pixels = (UINT8*)mapped + sizeof(SharedFrameHeader);
         
-        // Header'ı sıfırla
-        memset(header, 0, sizeof(SharedFrameHeader));
+        // Header'ı sıfırla (eğer inject yapacaksak; dış injector'a güveniyorsak DOKUNMA)
+        if (!skipInject) {
+            memset(header, 0, sizeof(SharedFrameHeader));
+        }
         
         // Event olustur
         hEvent = CreateEventW(NULL, FALSE, FALSE, EVENT_NAME);
         
-        // DLL'i inject et
-        if (!InjectDll(targetPid, dllPath, errorMsg)) {
-            Cleanup();
-            return false;
+        // DLL'i inject et (skipInject=false ise)
+        // 32-bit oyunlar için JS tarafı 32-bit injector.exe spawn etmiş olacak,
+        // bu durumda skipInject=true geçilir ve sadece SHM'e bağlanırız.
+        if (!skipInject) {
+            if (!InjectDll(targetPid, dllPath, errorMsg)) {
+                Cleanup();
+                return false;
+            }
         }
         
         initialized = true;
@@ -536,8 +546,9 @@ Napi::Value CaptureToBuffer(const Napi::CallbackInfo& info) {
 // JAVASCRIPT EXPORTS — GAME CAPTURE (YENI)
 // ═══════════════════════════════════════════════════════════════════════
 
-// gameCaptureStart(processName, dllPath) → { success, pid, error? }
+// gameCaptureStart(processName, dllPath, skipInject=false) → { success, pid, error? }
 // Oyun process'ine DLL inject eder, shared memory baglar
+// skipInject=true ise inject yapmaz (32-bit oyunlar için, JS tarafı 32-bit injector spawn etmiş olur)
 Napi::Value GameCaptureStart(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     
@@ -548,6 +559,10 @@ Napi::Value GameCaptureStart(const Napi::CallbackInfo& info) {
     
     std::string processName = info[0].As<Napi::String>().Utf8Value();
     std::string dllPath = info[1].As<Napi::String>().Utf8Value();
+    bool skipInject = false;
+    if (info.Length() >= 3 && info[2].IsBoolean()) {
+        skipInject = info[2].As<Napi::Boolean>().Value();
+    }
     
     if (g_gameCapture) {
         delete g_gameCapture;
@@ -556,12 +571,13 @@ Napi::Value GameCaptureStart(const Napi::CallbackInfo& info) {
     g_gameCapture = new GameCapture();
     
     std::string errorMsg;
-    bool ok = g_gameCapture->Start(processName, dllPath, errorMsg);
+    bool ok = g_gameCapture->Start(processName, dllPath, errorMsg, skipInject);
     
     Napi::Object result = Napi::Object::New(env);
     result.Set("success", Napi::Boolean::New(env, ok));
     if (ok) {
         result.Set("pid", Napi::Number::New(env, g_gameCapture->GetTargetPid()));
+        result.Set("skipInject", Napi::Boolean::New(env, skipInject));
     } else {
         result.Set("error", Napi::String::New(env, errorMsg));
         delete g_gameCapture;
@@ -647,6 +663,325 @@ Napi::Value GameCaptureStatus(const Napi::CallbackInfo& info) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// AUTO-DETECT GAMES (Phase 7)
+// 
+// EnumProcesses ile çalışan tüm process'leri tarar, her birinin yüklü
+// DLL'lerini kontrol eder. Eğer aşağıdaki graphics API DLL'lerinden biri
+// yüklüyse, o process bir "oyun" sayılır:
+//   - d3d9.dll      → DX9
+//   - d3d10.dll     → DX10
+//   - d3d11.dll     → DX11
+//   - d3d12.dll     → DX12
+//   - opengl32.dll  → OpenGL
+//   - vulkan-1.dll  → Vulkan
+// 
+// Filtrelenenler (sistem process'leri, browser'lar, vs):
+//   - Windows sistem process'leri
+//   - Bilinen tarayıcılar (Chrome, Firefox, vs - bunlar DX11 kullanır ama oyun değil)
+//   - ShadowRec'in kendisi
+// ═══════════════════════════════════════════════════════════════════════
+
+// Sistem ve bilinen non-game process'ler (case-insensitive)
+static const std::vector<std::string> kBlacklistExes = {
+    // Windows sistem
+    "system", "registry", "smss.exe", "csrss.exe", "wininit.exe", "services.exe",
+    "lsass.exe", "winlogon.exe", "svchost.exe", "fontdrvhost.exe", "dwm.exe",
+    "explorer.exe", "taskhostw.exe", "RuntimeBroker.exe", "SearchApp.exe",
+    "TextInputHost.exe", "ApplicationFrameHost.exe", "ShellExperienceHost.exe",
+    "dllhost.exe", "conhost.exe", "ctfmon.exe", "sihost.exe", "spoolsv.exe",
+    "audiodg.exe", "WmiPrvSE.exe", "smartscreen.exe", "backgroundTaskHost.exe",
+    "MiniBug.exe", "CompPkgSrv.exe", "UserOOBEBroker.exe", "SystemSettings.exe",
+    
+    // Tarayıcılar (DX11 kullanır ama oyun değil)
+    "chrome.exe", "firefox.exe", "msedge.exe", "opera.exe", "brave.exe",
+    "msedgewebview2.exe", "iexplore.exe", "vivaldi.exe",
+    
+    // Discord, Slack, Teams (Electron - DX11)
+    "discord.exe", "slack.exe", "teams.exe", "skype.exe", "zoom.exe",
+    
+    // NVIDIA/AMD overlay'ler
+    "NVIDIA Overlay.exe", "nvcontainer.exe", "NVDisplay.Container.exe",
+    "nvsphelper64.exe", "NVIDIA Web Helper.exe",
+    
+    // Steam UI
+    "steam.exe", "steamwebhelper.exe", "steamservice.exe", "gameoverlayui64.exe",
+    
+    // ShadowRec'in kendisi (Electron)
+    "shadowrec.exe", "electron.exe",
+    
+    // VS Code, IDE'ler
+    "Code.exe", "devenv.exe", "claude.exe",
+    
+    // Anti-cheat (banlamayalım)
+    "EasyAntiCheat.exe", "BEService.exe", "vgc.exe", "vgk.exe",
+    
+    // Office, PDF
+    "WINWORD.EXE", "EXCEL.EXE", "POWERPNT.EXE", "OUTLOOK.EXE",
+    "AcroRd32.exe", "Acrobat.exe",
+    
+    // WhatsApp, mesajlaşma
+    "WhatsApp.exe", "WhatsApp.Root.exe",
+    
+    // Photoshop, vs
+    "Photoshop.exe", "Illustrator.exe", "Premiere.exe", "AfterFX.exe",
+    
+    // Sistem servisleri
+    "MSPCManager.exe", "MSPCManagerCore.exe", "ekrn.exe", "eguiProxy.exe",
+    "warp-svc.exe", "FvContainer.exe", "FvContainer.System.exe",
+    "PresentMon_x64.exe", "MxNotify.exe", "MxRedirect.exe",
+    "SecurityHealthService.exe", "SecurityHealthSystray.exe",
+};
+
+bool IsBlacklisted(const std::string& exeName) {
+    for (const auto& bad : kBlacklistExes) {
+        // Case-insensitive karşılaştırma
+        if (exeName.size() != bad.size()) continue;
+        bool match = true;
+        for (size_t i = 0; i < exeName.size(); i++) {
+            if (tolower((unsigned char)exeName[i]) != tolower((unsigned char)bad[i])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+struct GameInfo {
+    DWORD pid;
+    std::string exeName;
+    std::string windowTitle;
+    std::string api;  // "DX9", "DX11", "DX12", "OpenGL", "Vulkan", "DX9+DX11" vs
+};
+
+// Process'in pencere başlığını al
+struct EnumWindowsData {
+    DWORD pid;
+    std::string title;
+};
+
+BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
+    EnumWindowsData* data = (EnumWindowsData*)lParam;
+    DWORD windowPid = 0;
+    GetWindowThreadProcessId(hwnd, &windowPid);
+    
+    if (windowPid != data->pid) return TRUE;
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    
+    // Pencere başlığını al
+    wchar_t title[256] = { 0 };
+    int len = GetWindowTextW(hwnd, title, 256);
+    if (len > 0) {
+        // wchar_t → std::string (UTF-8)
+        int sz = WideCharToMultiByte(CP_UTF8, 0, title, len, nullptr, 0, nullptr, nullptr);
+        if (sz > 0) {
+            data->title.resize(sz);
+            WideCharToMultiByte(CP_UTF8, 0, title, len, &data->title[0], sz, nullptr, nullptr);
+            return FALSE;  // Bulduk, dur
+        }
+    }
+    return TRUE;
+}
+
+std::string GetProcessWindowTitle(DWORD pid) {
+    EnumWindowsData data = { pid, "" };
+    EnumWindows(EnumWindowsProc, (LPARAM)&data);
+    return data.title;
+}
+
+// Process'in yüklü modüllerini kontrol et, hangi graphics API'leri kullanıyor öğren
+// EnumProcessModulesEx ile LIST_MODULES_ALL: hem 32-bit hem 64-bit modülleri listeler
+std::string DetectGraphicsAPI(DWORD pid) {
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!hProcess) {
+        // PROCESS_QUERY_INFORMATION reddedilirse, daha düşük yetkiyle dene
+        hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!hProcess) return "";
+    }
+    
+    HMODULE modules[2048];
+    DWORD bytesNeeded = 0;
+    
+    // ⭐ EnumProcessModulesEx + LIST_MODULES_ALL — cross-architecture (32+64 bit)
+    BOOL ok = EnumProcessModulesEx(hProcess, modules, sizeof(modules), &bytesNeeded, LIST_MODULES_ALL);
+    if (!ok) {
+        // Fallback: normal EnumProcessModules
+        ok = EnumProcessModules(hProcess, modules, sizeof(modules), &bytesNeeded);
+    }
+    
+    if (!ok) {
+        CloseHandle(hProcess);
+        return "";
+    }
+    
+    int moduleCount = bytesNeeded / sizeof(HMODULE);
+    std::set<std::string> apis;
+    bool hasDgVoodoo = false;
+    
+    for (int i = 0; i < moduleCount; i++) {
+        wchar_t modName[MAX_PATH];
+        if (GetModuleBaseNameW(hProcess, modules[i], modName, MAX_PATH)) {
+            // Lowercase compare
+            std::wstring name(modName);
+            std::transform(name.begin(), name.end(), name.begin(),
+                [](wchar_t c) { return towlower(c); });
+            
+            // Standart graphics API
+            if (name == L"d3d9.dll") apis.insert("DX9");
+            else if (name == L"d3d10.dll" || name == L"d3d10_1.dll") apis.insert("DX10");
+            else if (name == L"d3d11.dll") apis.insert("DX11");
+            else if (name == L"d3d12.dll") apis.insert("DX12");
+            else if (name == L"dxgi.dll") apis.insert("DXGI");  // DX10+
+            else if (name == L"opengl32.dll") apis.insert("OpenGL");
+            else if (name == L"vulkan-1.dll") apis.insert("Vulkan");
+            
+            // dgVoodoo wrapper tespiti (T3 ve diğer eski oyunlar için)
+            else if (name == L"d3d8.dll") { apis.insert("DX8"); hasDgVoodoo = true; }
+            else if (name == L"ddraw.dll") { apis.insert("DDraw"); hasDgVoodoo = true; }
+            else if (name == L"dgvoodoo.dll" || name == L"dgvoodoocpl.exe") hasDgVoodoo = true;
+        }
+    }
+    
+    CloseHandle(hProcess);
+    
+    // DXGI tek başına = DX10/11 backend ile gösterilebilir, "DXGI" göstermeyelim çıplak
+    if (apis.count("DXGI") && (apis.count("DX10") || apis.count("DX11") || apis.count("DX12"))) {
+        apis.erase("DXGI");
+    }
+    
+    // API'leri birleştir
+    std::string result;
+    for (const auto& a : apis) {
+        if (!result.empty()) result += "+";
+        result += a;
+    }
+    if (hasDgVoodoo && !result.empty()) result += " (dgVoodoo)";
+    return result;
+}
+
+// Hedef process'in 32-bit (WOW64) mı yoksa 64-bit mi olduğunu tespit eder
+// true = 32-bit (WOW64 üzerinde çalışıyor), false = 64-bit
+bool IsTargetWow64(DWORD pid) {
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProcess) return false;
+    
+    BOOL isWow64 = FALSE;
+    IsWow64Process(hProcess, &isWow64);
+    CloseHandle(hProcess);
+    return isWow64 ? true : false;
+}
+
+// getProcessArchitecture(processName) → { found, pid, isWow64, arch, error? }
+// Process adından mimari tespit eder, JS tarafı doğru DLL+injector seçer
+Napi::Value GetProcessArchitecture(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    Napi::Object result = Napi::Object::New(env);
+    
+    if (info.Length() < 1 || !info[0].IsString()) {
+        result.Set("found", Napi::Boolean::New(env, false));
+        result.Set("error", Napi::String::New(env, "processName bekleniyor"));
+        return result;
+    }
+    
+    std::string processName = info[0].As<Napi::String>().Utf8Value();
+    
+    // Process'i bul
+    DWORD pid = GameCapture::FindProcessByName(processName);
+    if (!pid) {
+        result.Set("found", Napi::Boolean::New(env, false));
+        result.Set("error", Napi::String::New(env, "Process bulunamadi: " + processName));
+        return result;
+    }
+    
+    bool isWow64 = IsTargetWow64(pid);
+    result.Set("found", Napi::Boolean::New(env, true));
+    result.Set("pid", Napi::Number::New(env, pid));
+    result.Set("isWow64", Napi::Boolean::New(env, isWow64));
+    result.Set("arch", Napi::String::New(env, isWow64 ? "x86" : "x64"));
+    return result;
+}
+
+// enumGames() → [{ pid, exeName, windowTitle, api, isWow64 }, ...]
+Napi::Value EnumGames(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    Napi::Array result = Napi::Array::New(env);
+    
+    DWORD myPid = GetCurrentProcessId();
+    
+    // Tüm process'leri al
+    DWORD pids[2048];
+    DWORD bytesReturned = 0;
+    if (!EnumProcesses(pids, sizeof(pids), &bytesReturned)) {
+        return result;
+    }
+    
+    int pidCount = bytesReturned / sizeof(DWORD);
+    int found = 0;
+    
+    for (int i = 0; i < pidCount; i++) {
+        DWORD pid = pids[i];
+        if (pid == 0 || pid == 4 || pid == myPid) continue;  // System, Idle, kendimiz
+        
+        // Process adını al
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!hProcess) continue;
+        
+        char exeName[MAX_PATH];
+        DWORD size = MAX_PATH;
+        if (!QueryFullProcessImageNameA(hProcess, 0, exeName, &size)) {
+            CloseHandle(hProcess);
+            continue;
+        }
+        
+        // ⭐ 32-bit / 64-bit tespiti
+        BOOL isWow64 = FALSE;
+        IsWow64Process(hProcess, &isWow64);
+        
+        CloseHandle(hProcess);
+        
+        // Sadece exe dosya adını al (path'i at)
+        std::string fullPath = exeName;
+        size_t lastSlash = fullPath.find_last_of("\\/");
+        std::string baseName = (lastSlash != std::string::npos) 
+            ? fullPath.substr(lastSlash + 1) 
+            : fullPath;
+        
+        // Blacklist kontrolü
+        if (IsBlacklisted(baseName)) continue;
+        
+        // Pencere başlığını al
+        std::string windowTitle = GetProcessWindowTitle(pid);
+        
+        // Graphics API tespit et
+        std::string api = DetectGraphicsAPI(pid);
+        
+        // ⭐ Module listelenemediyse (32-bit Wow64 sınırı veya korumalı process),
+        // pencere başlığı varsa ekle - kullanıcı manuel onaylayacak.
+        // İçinde 3D oyun anlamına gelen anahtar kelimeler olabilir.
+        bool moduleListFailed = api.empty();
+        if (moduleListFailed) {
+            if (windowTitle.empty()) continue;  // Hem API yok hem pencere yok → oyun değil
+            // Pencere başlığı var → muhtemelen oyun, "Unknown" olarak göster
+            api = "?";
+        }
+        
+        // JS objesini oluştur
+        Napi::Object game = Napi::Object::New(env);
+        game.Set("pid", Napi::Number::New(env, pid));
+        game.Set("exeName", Napi::String::New(env, baseName));
+        game.Set("fullPath", Napi::String::New(env, fullPath));
+        game.Set("windowTitle", Napi::String::New(env, windowTitle));
+        game.Set("api", Napi::String::New(env, api));
+        game.Set("isWow64", Napi::Boolean::New(env, isWow64 ? true : false));  // ⭐ 32-bit mi?
+        game.Set("arch", Napi::String::New(env, isWow64 ? "x86" : "x64"));     // ⭐ İnsan okunabilir
+        result.Set(found++, game);
+    }
+    
+    return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // MODULE INIT
 // ═══════════════════════════════════════════════════════════════════════
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
@@ -662,6 +997,12 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("gameCaptureRead", Napi::Function::New(env, GameCaptureRead));
     exports.Set("gameCaptureStop", Napi::Function::New(env, GameCaptureStop));
     exports.Set("gameCaptureStatus", Napi::Function::New(env, GameCaptureStatus));
+    
+    // Auto-detect games (YENI - Phase 7)
+    exports.Set("enumGames", Napi::Function::New(env, EnumGames));
+    
+    // Architecture detection (YENI - Phase 8 - 32/64-bit)
+    exports.Set("getProcessArchitecture", Napi::Function::New(env, GetProcessArchitecture));
     
     return exports;
 }
